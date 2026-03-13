@@ -1,0 +1,217 @@
+<style>
+  #xbg-scene {
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    overflow: hidden;
+    cursor: none;
+    z-index: 0;
+  }
+  #xbg-canvas {
+    position: absolute;
+    inset: 0;
+    display: block;
+    pointer-events: none;
+  }
+</style>
+
+<div id="xbg-scene">
+  <canvas id="xbg-canvas"></canvas>
+</div>
+
+<script>
+(function () {
+  const scene  = document.getElementById('xbg-scene');
+  const canvas = document.getElementById('xbg-canvas');
+  const ctx    = canvas.getContext('2d');
+
+  const BG        = '#9B9EF6';
+  const XC_FAINT  = '#9B9EF6';
+  const XC_ACTIVE = '#FF6F57';
+  const XS        = 7;
+  const SPACING   = XS * 2;
+
+  let W, H, dpr, baseRadius;
+  let mouse       = { x: -9999, y: -9999 };
+  let anchor      = { x: -9999, y: -9999 };
+  let anchorVel   = { x: 0, y: 0 };
+  let smoothVel   = { x: 0, y: 0 };
+  let smoothAngle = -Math.PI / 2;
+  let morphT      = 0;
+  let active      = false;
+
+  const noiseCache = new Map();
+  function cellNoise(x, y) {
+    const key = `${x},${y}`;
+    if (!noiseCache.has(key)) noiseCache.set(key, Math.random());
+    return noiseCache.get(key);
+  }
+
+  function resize() {
+    const r = scene.getBoundingClientRect();
+    W = r.width; H = r.height;
+    dpr = window.devicePixelRatio || 1;
+    canvas.width  = Math.round(W * dpr);
+    canvas.height = Math.round(H * dpr);
+    canvas.style.width  = W + 'px';
+    canvas.style.height = H + 'px';
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    /* 15% of viewport area */
+    baseRadius = Math.round(Math.sqrt(0.15 * W * H / Math.PI));
+  }
+
+  function snap(v, s) { return Math.round(v / s) * s; }
+
+  function lerpAngle(a, b, t) {
+    let d = b - a;
+    while (d >  Math.PI) d -= Math.PI * 2;
+    while (d < -Math.PI) d += Math.PI * 2;
+    return a + d * t;
+  }
+
+  function shapeDist(px, py, ax, ay, radius, ang, t) {
+    const cos = Math.cos(-ang), sin = Math.sin(-ang);
+    const dx = px - ax, dy = py - ay;
+    const lx = dx * cos - dy * sin;
+    const ly = dx * sin + dy * cos;
+    const circleDist = Math.sqrt(lx * lx + ly * ly) / radius;
+    const nx = lx / radius, ny = ly / radius;
+    const tx = nx - 0.5;
+    const halfWidth = Math.max(0, -tx);
+    const triDist   = Math.max(Math.abs(ny) / Math.max(halfWidth, 0.001) - 1, tx - 0.5) * 1.8 + 0.5;
+    return circleDist * (1 - t) + triDist * t;
+  }
+
+  function strokeForDist(nd, noise) {
+    /* Max 5px — avoids blobbing at the dense centre */
+    return Math.max(0.3, 5 * Math.pow(1 - nd, 1.6) * (1 + (noise - 0.5) * 0.25));
+  }
+
+  function shouldDraw(nd, noise, sw) {
+    if (nd > 0.7) {
+      const dropChance = ((nd - 0.7) / 0.3) * 0.7;
+      if (noise < dropChance) return false;
+    }
+    if (sw < 1) {
+      const n2 = cellNoise((nd * 1000) | 0, (noise * 1000) | 0);
+      if (n2 > sw) return false;
+    }
+    return true;
+  }
+
+  function drawX(x, y, sw, color, alpha, blend) {
+    ctx.save();
+    ctx.globalAlpha = alpha;
+    ctx.globalCompositeOperation = blend;
+    ctx.strokeStyle = color;
+    ctx.lineWidth   = Math.max(1, sw);
+    ctx.lineCap     = 'square';
+    ctx.translate(x, y);
+    ctx.rotate(Math.PI / 4);
+    ctx.beginPath();
+    ctx.moveTo(-XS, 0); ctx.lineTo(XS, 0);
+    ctx.moveTo(0, -XS); ctx.lineTo(0, XS);
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  function loop() {
+    requestAnimationFrame(loop);
+
+    if (active) {
+      anchorVel.x = anchorVel.x * 0.80 + (mouse.x - anchor.x) * 0.05;
+      anchorVel.y = anchorVel.y * 0.80 + (mouse.y - anchor.y) * 0.05;
+      anchor.x += anchorVel.x;
+      anchor.y += anchorVel.y;
+      smoothVel.x = smoothVel.x * 0.85 + anchorVel.x * 0.15;
+      smoothVel.y = smoothVel.y * 0.85 + anchorVel.y * 0.15;
+      const spd = Math.sqrt(smoothVel.x ** 2 + smoothVel.y ** 2);
+      const targetT = Math.min(0.45, spd * 0.09);
+      morphT += (targetT - morphT) * 0.05;
+      if (spd > 0.3) {
+        const t = Math.min(0.06, 0.02 + spd * 0.004);
+        smoothAngle = lerpAngle(smoothAngle, Math.atan2(smoothVel.y, smoothVel.x), t);
+      }
+    } else {
+      morphT += (0 - morphT) * 0.05;
+    }
+
+    ctx.save();
+    ctx.globalCompositeOperation = 'source-over';
+    ctx.globalAlpha = 1;
+    ctx.fillStyle   = BG;
+    ctx.fillRect(0, 0, W, H);
+    ctx.restore();
+
+    const cols = Math.ceil(W / SPACING) + 2;
+    const rows = Math.ceil(H / SPACING) + 2;
+    const activePoints = [], formSet = new Set();
+
+    if (active || morphT > 0.01) {
+      const ax     = anchor.x, ay = anchor.y;
+      const spd    = active ? Math.sqrt(smoothVel.x ** 2 + smoothVel.y ** 2) : 0;
+      const stretch = Math.min(1.4, 1 + spd * 0.10);
+      const margin  = baseRadius * stretch * 1.4;
+
+      for (let r = Math.floor((ay - margin) / SPACING); r <= Math.ceil((ay + margin) / SPACING); r++) {
+        for (let c = Math.floor((ax - margin) / SPACING); c <= Math.ceil((ax + margin) / SPACING); c++) {
+          const x  = c * SPACING;
+          const y  = r * SPACING;
+          const nd = shapeDist(x, y, ax, ay, baseRadius, smoothAngle, morphT);
+          if (nd <= 1) {
+            const noise = cellNoise(x, y);
+            const sw    = strokeForDist(nd, noise);
+            if (shouldDraw(nd, noise, sw)) {
+              activePoints.push({ x, y, sw });
+              formSet.add(`${x},${y}`);
+            }
+          }
+        }
+      }
+    }
+
+    for (let r = 0; r < rows; r++) {
+      for (let c = 0; c < cols; c++) {
+        const x = c * SPACING;
+        const y = r * SPACING;
+        if (formSet.has(`${x},${y}`)) continue;
+        drawX(x, y, 0.6, XC_FAINT, 0.1, 'multiply');
+      }
+    }
+
+    for (const p of activePoints) {
+      drawX(p.x, p.y, p.sw, XC_ACTIVE, 1, 'source-over');
+    }
+
+    if (active) {
+      drawX(snap(mouse.x, SPACING), snap(mouse.y, SPACING), 5, XC_ACTIVE, 1, 'source-over');
+    }
+  }
+
+  function updateMouse(e) {
+    const rect   = scene.getBoundingClientRect();
+    const nx     = e.clientX - rect.left;
+    const ny     = e.clientY - rect.top;
+    const inside = nx >= 0 && ny >= 0 && nx <= W && ny <= H;
+    if (inside) {
+      mouse.x = nx; mouse.y = ny;
+      if (!active) {
+        anchor.x  = nx; anchor.y  = ny;
+        anchorVel = { x: 0, y: 0 };
+        smoothVel = { x: 0, y: 0 };
+        active    = true;
+      }
+    } else {
+      active    = false;
+      mouse.x   = -9999; mouse.y = -9999;
+      smoothVel = { x: 0, y: 0 };
+    }
+  }
+
+  window.addEventListener('mousemove', updateMouse);
+  window.addEventListener('resize', resize);
+  resize();
+  loop();
+})();
+</script>
